@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="DocuMind AI — Upload documents and ask questions powered by RAG and Google Gemini. Get accurate, citation-backed answers from your PDFs and text files.">
+  <meta name="theme-color" content="#0a0a0f">
+
+  <title>DocuMind AI — Document Intelligence Assistant</title>
+
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ── Sidebar ─────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <div class="logo-icon">🧠</div>
+        <div class="logo-text">
+          <h1>DocuMind AI</h1>
+          <span>Document Intelligence</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Upload Zone -->
+    <div class="upload-section">
+      <div class="upload-zone" id="upload-zone">
+        <span class="upload-icon">📤</span>
+        <h3>Upload Document</h3>
+        <p>Drag & drop or click — PDF, TXT, MD</p>
+        <input type="file" id="file-upload" accept=".pdf,.txt,.md,.text" />
+      </div>
+    </div>
+
+    <!-- Upload Progress -->
+    <div class="upload-progress" id="upload-progress">
+      <div class="progress-bar">
+        <div class="progress-fill"></div>
+      </div>
+      <div class="progress-text">Processing...</div>
+    </div>
+
+    <!-- Document List -->
+    <div class="documents-section">
+      <div class="section-label">Your Documents</div>
+      <ul class="doc-list" id="doc-list"></ul>
+      <div class="doc-empty" id="doc-empty">
+        <div class="empty-icon">📂</div>
+        <p>No documents yet.<br>Upload one to get started!</p>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Mobile sidebar overlay -->
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+  <!-- ── Main Chat Area ──────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Chat Header -->
+    <header class="chat-header">
+      <div class="chat-title">
+        <button class="btn-icon sidebar-toggle" id="sidebar-toggle" title="Toggle sidebar">☰</button>
+        <h2>Chat</h2>
+        <div class="active-doc-badge hidden" id="active-doc-badge">
+          <span class="dot"></span>
+          <span class="active-doc-name" id="active-doc-name">document.pdf</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="btn-icon" title="Clear chat" onclick="location.reload()">🗑️</button>
+      </div>
+    </header>
+
+    <!-- Chat Messages -->
+    <div class="chat-messages" id="chat-messages">
+      <div class="welcome-screen" id="welcome-screen">
+        <div class="welcome-icon">🧠</div>
+        <h2>Welcome to DocuMind AI</h2>
+        <p>Upload a document, then ask questions. I'll give you accurate, citation-backed answers powered by AI.</p>
+        <div class="welcome-features">
+          <div class="feature-card">
+            <span class="feat-icon">📄</span>
+            <h4>Upload</h4>
+            <p>PDF, TXT, or Markdown files</p>
+          </div>
+          <div class="feature-card">
+            <span class="feat-icon">💬</span>
+            <h4>Ask</h4>
+            <p>Natural language questions</p>
+          </div>
+          <div class="feature-card">
+            <span class="feat-icon">📌</span>
+            <h4>Citations</h4>
+            <p>Sources with page numbers</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chat Input -->
+    <div class="chat-input-container">
+      <div class="chat-input-wrapper">
+        <textarea
+          class="chat-input"
+          id="chat-input"
+          placeholder="Upload a document first, then ask your question..."
+          rows="1"
+          aria-label="Type your question"
+        ></textarea>
+        <button class="send-btn" id="send-btn" title="Send message" aria-label="Send">
+          ➤
+        </button>
+      </div>
+      <div class="input-hint">Press Enter to send · Shift + Enter for new line</div>
+    </div>
+  </main>
+
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+TEST 
+Document-Based AI Assistant
+
+RAG + FastAPI + Frontend
+
+PROBLEM STATEMENT
+Build a small full-stack AI assistant that allows users to upload a PDF or text document, then ask questions about its content using an LLM.
+REQUIREMENTS — BACKEND
+Framework: FastAPI (or Flask / Node).
+Endpoint to upload a file.
+Extract text, chunk it, generate embeddings, and store in a vector DB (Supabase Vector, Chroma, etc.).
+Chat endpoint that:
+Retrieves relevant chunks for the user query.
+Calls an LLM (OpenAI / Claude / Gemini) with retrieved context.
+Returns the answer with optional citations (chunk IDs or page numbers).
+REQUIREMENTS — FRONTEND
+Framework: React / Next.js / Streamlit, or simple HTML + JS.
+File upload form.
+Chat interface showing:
+User query.
+AI response (streaming if possible).
+Optional “view sources” that highlights which chunks were used.
+EXPECTED OUTPUT
+A working micro app (local or deployed) where:
+•  User can upload a document.
+•  User can ask questions and get answers grounded in the document.
+•  Answers include some indication of source (e.g., “Based on page 3…” or clickable chunk references).
+
+
+
+DELIVERABLE — README
+Tech stack.
+How chunking / retrieval works.
+
+
+
+
