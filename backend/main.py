@@ -2,8 +2,10 @@
 #  FastAPI Server — Document-Based AI Assistant
 # ──────────────────────────────────────────────────────────────
 import os
+import uuid
+import tempfile
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
@@ -35,6 +37,41 @@ app.add_middleware(
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
+# ── Task Tracking ────────────────────────────────────────────
+tasks_status = {}
+
+def process_document_background(task_id: str, file_path: str, filename: str, file_type: str):
+    """Background task to process large documents without blocking the server."""
+    tasks_status[task_id] = {"status": "processing", "progress": 20}
+    try:
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        
+        doc_info = process_document(
+            file_bytes=file_bytes,
+            filename=filename,
+            file_type=file_type,
+        )
+        
+        tasks_status[task_id] = {
+            "status": "completed",
+            "progress": 100,
+            "document": {
+                "id": doc_info.id,
+                "name": doc_info.name,
+                "num_chunks": doc_info.num_chunks,
+                "num_pages": doc_info.num_pages,
+                "file_type": doc_info.file_type,
+                "uploaded_at": doc_info.uploaded_at,
+            },
+            "message": f"Successfully processed '{filename}': {doc_info.num_chunks} chunks from {doc_info.num_pages} pages."
+        }
+    except Exception as e:
+        tasks_status[task_id] = {"status": "failed", "error": str(e), "progress": 0}
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
 # ── Pydantic Models ──────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -57,19 +94,18 @@ async def health_check():
 
 
 @app.post("/api/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
     Upload a PDF or text file.
-    Extracts text, chunks it, generates embeddings, stores in ChromaDB.
+    Returns a task ID that can be polled for progress.
     """
-    # Validate file type
     allowed_types = [
         "application/pdf",
         "text/plain",
         "text/markdown",
         "application/octet-stream",
     ]
-    allowed_extensions = [".pdf", ".txt", ".md", ".text"]
+    allowed_extensions = [".pdf", ".txt", ".md", ".text", ".docx", ".pptx", ".xlsx", ".csv"]
 
     filename = file.filename or "unknown"
     ext = os.path.splitext(filename)[1].lower()
@@ -77,45 +113,37 @@ async def upload_document(file: UploadFile = File(...)):
     if ext not in allowed_extensions and file.content_type not in allowed_types:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Please upload a PDF or text file.",
+            detail=f"Unsupported file type: {file.content_type}. Please upload a valid document.",
         )
 
     try:
+        task_id = str(uuid.uuid4())
+        temp_path = os.path.join(tempfile.gettempdir(), f"{task_id}_{filename}")
+        
         file_bytes = await file.read()
-
         if len(file_bytes) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+            
+        with open(temp_path, "wb") as f:
+            f.write(file_bytes)
+            
+        tasks_status[task_id] = {"status": "queued", "progress": 0}
+        background_tasks.add_task(process_document_background, task_id, temp_path, filename, file.content_type or "")
+        
+        return {"task_id": task_id, "message": "Upload started. Processing in background."}
 
-        # Process: extract → chunk → embed → store
-        doc_info = process_document(
-            file_bytes=file_bytes,
-            filename=filename,
-            file_type=file.content_type or "",
-        )
-
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "document": {
-                    "id": doc_info.id,
-                    "name": doc_info.name,
-                    "num_chunks": doc_info.num_chunks,
-                    "num_pages": doc_info.num_pages,
-                    "file_type": doc_info.file_type,
-                    "uploaded_at": doc_info.uploaded_at,
-                },
-                "message": f"Successfully processed '{filename}': {doc_info.num_chunks} chunks from {doc_info.num_pages} pages.",
-            },
-        )
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Error processing file: {str(e)}",
+            detail=f"Error initiating file processing: {str(e)}",
         )
+
+@app.get("/api/upload/status/{task_id}")
+async def get_upload_status(task_id: str):
+    """Poll this endpoint to get the status of an upload task."""
+    if task_id not in tasks_status:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return tasks_status[task_id]
 
 
 @app.post("/api/chat")

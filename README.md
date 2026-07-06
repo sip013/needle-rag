@@ -1,48 +1,61 @@
-# 🧠 DocuMind AI — Document-Based AI Assistant
+# 🧭 Needle — Enterprise RAG Platform
 
-> Upload documents. Ask questions. Get accurate, citation-backed answers powered by RAG + Google Gemini.
+> An industrial-grade Retrieval-Augmented Generation (RAG) system featuring Multi-Modal Parsing, Hybrid Search (Vector + Keyword), Reciprocal Rank Fusion, and Parent-Child Chunking. Designed with a premium minimalist aesthetic.
 
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
-![Python](https://img.shields.io/badge/Python_3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python_3.13-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![ChromaDB](https://img.shields.io/badge/ChromaDB-FF6B6B?style=for-the-badge)
+![SQLite](https://img.shields.io/badge/SQLite_FTS5-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
 ![Gemini](https://img.shields.io/badge/Google_Gemini-4285F4?style=for-the-badge&logo=google&logoColor=white)
-![NumPy](https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white)
 
 ---
 
 ## ✨ Features
 
-- **📄 Document Upload** — Drag & drop PDF, TXT, or Markdown files
-- **💬 AI Chat** — Ask natural language questions about your documents
-- **🔄 Streaming Responses** — Real-time token-by-token SSE streaming
-- **📌 Source Citations** — Page numbers and clickable chunk references
-- **🎯 Semantic Search** — Vector similarity retrieval using embeddings
-- **🗂️ Multi-Document** — Upload and manage multiple documents
-- **🎨 Premium UI** — Dark theme with glassmorphism and micro-animations
-- **📱 Responsive** — Works on desktop and mobile
+- **🌐 Global Database Chat** — Query your entire unified database, or isolate to a single document.
+- **⚡ True Hybrid Search** — Runs parallel semantic (Vector) and exact-match (Keyword) searches to never miss a fact or serial number.
+- **⚖️ Reciprocal Rank Fusion (RRF)** — Mathematically merges Vector and Keyword results using a `k=60` consensus algorithm, featuring a dynamic *relative drop-off gate* to eliminate hallucinations before they reach the LLM.
+- **🏗️ Parent-Child Chunking** — Granular 400-char child chunks for laser-focused semantic retrieval, seamlessly mapped back to massive 2,000-char parent chunks to preserve surrounding context.
+- **📊 Metadata Scaffolding** — Automatically extracts Markdown headers (Chapters/Sections) to provide spatial awareness to citations.
+- **📄 Multi-Modal Parsing** — Processes text-based PDFs, DOCX, PPTX, and XLSX using `PyMuPDF` and Microsoft's `MarkItDown`.
+- **🆓 Unlimited Free Embeddings** — Swapped out cloud embeddings for local, highly-optimized `all-MiniLM-L6-v2` running via ONNX Runtime for zero rate limits and maximum privacy.
+- **🚀 Async Ingestion** — FastAPI background tasks ensure massive 400-page textbooks process without blocking the server.
+- **🎨 Premium UI/UX** — A handcrafted Charcoal/Zinc aesthetic featuring fluid glassmorphism, responsive floating chat components, and a perfectly centered conversational layout.
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Enterprise RAG Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    FRONTEND                          │
-│  Upload Panel  │  Chat Interface  │  Source Viewer   │
-└────────┬───────────────┬──────────────┬──────────────┘
-         │               │              │
-    POST /upload    POST /chat     GET /documents
-         │               │              │
-┌────────▼───────────────▼──────────────▼──────────────┐
-│                  FastAPI BACKEND                      │
-│                                                       │
-│   PDF/Text Parser → Smart Chunker → Embeddings       │
-│                                          ↓            │
-│                             Numpy Vector Store        │
-│                                          ↓            │
-│   User Query → Embedding → Similarity Search         │
-│                                          ↓            │
-│              Relevant Chunks + LLM → Streamed Answer  │
-└───────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                      FRONTEND                           │
+│     Global Chat  │  Isolated Mode  │  Source Citations  │
+└────────┬──────────────────┬───────────────────┬─────────┘
+         │                  │                   │
+    POST /upload       POST /chat        GET /documents
+         │                  │                   │
+┌────────▼──────────────────▼───────────────────▼─────────┐
+│                    FastAPI BACKEND                      │
+│                                                         │
+│  [1] MULTI-MODAL PARSER (MarkItDown / PyMuPDF)          │
+│        ↓ (Rejects Corrupted / Encrypted files)          │
+│  [2] METADATA SCAFFOLDING (Header Extractor)            │
+│        ↓                                                │
+│  [3] PARENT-CHILD CHUNKER (2000-char / 400-char)        │
+│        ↓                                                │
+│  ┌─────┴─────┐                                          │
+│  ↓           ↓                                          │
+│ CHROMA DB  SQLITE FTS5                                  │
+│ (Vectors)  (Keywords)                                   │
+│  │           │                                          │
+│  └─────┬─────┘                                          │
+│        ↓                                                │
+│  [4] HYBRID RETRIEVAL (Vector + BM25)                   │
+│        ↓                                                │
+│  [5] RRF FUSION & DYNAMIC DROP-OFF GATING               │
+│        ↓                                                │
+│  [6] GEMINI 2.5 LLM SYNTHESIS → Streamed Answer         │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -51,49 +64,39 @@
 
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| **Backend** | FastAPI | Async HTTP server with SSE streaming |
-| **LLM** | Google Gemini 2.0 Flash | Answer generation with context |
-| **Embeddings** | Gemini Embedding | Semantic vector representations |
-| **Vector DB** | Custom (NumPy) | Cosine similarity search, JSON + .npy persistence |
-| **PDF Parser** | pypdf | Pure Python PDF text extraction with page numbers |
-| **Frontend** | Vanilla HTML/CSS/JS | Premium dark UI, no framework overhead |
+| **Backend** | FastAPI | Async HTTP server with Background Tasks |
+| **Error Handling** | Exception Middleware | Graceful rejection of corrupted/encrypted files |
+| **LLM Synthesis** | Google Gemini 2.5 Flash | Final answer generation using injected context |
+| **Local Embeddings** | `all-MiniLM-L6-v2` | Open-source, CPU-optimized semantic vectors |
+| **Vector DB** | ChromaDB | Persistent vector similarity search |
+| **Keyword DB** | SQLite FTS5 | Blazing fast parallel sparse indexing (BM25) |
+| **Parsers** | PyMuPDF, MarkItDown | Page-aware PDF parsing and multi-modal conversions |
+| **Frontend** | Vanilla JS / CSS | Premium dark UI with SSE streaming and Global Chat |
 
 ---
 
-## 📖 How RAG Works
+## 📖 Deep Dive: How the Engine Works
 
-### 1. Document Ingestion
+### 1. Ingestion & Scaffolding
+When a document is uploaded, it is passed to either `PyMuPDF` (to preserve exact page numbers) or `MarkItDown` (to parse Word, Excel, PPTX). The `MarkdownHeaderTextSplitter` injects hierarchical scaffolding into the chunk metadata (e.g. `[Chapter 2 > Safety]`).
 
-```
-Upload File → Extract Text → Smart Chunking → Generate Embeddings → Store in ChromaDB
-```
+### 2. Parent-Child Chunking
+To prevent the classic RAG failure of "too little context" vs "diluted search meaning", text is split into **2,000-character Parent chunks**. These are then chopped into **400-character Child chunks** with 50-character overlaps. The DB only embeds the children, but when a child is matched during a query, the LLM is fed the entire 2,000-character parent.
 
-- **Text Extraction**: pypdf extracts text from PDFs page-by-page. Plain text files are split into virtual "pages" of ~3000 chars.
-- **Smart Chunking**: Text is recursively split (paragraphs → sentences → words) into ~800-character chunks with 200-char overlap. This ensures no information is lost at chunk boundaries.
-- **Embeddings**: Google Gemini's embedding model converts each chunk into a high-dimensional vector (semantic representation).
-- **Storage**: Chunks, embeddings, and metadata (page number, document ID) are stored in ChromaDB.
+### 3. Retrieval & Reciprocal Rank Fusion (RRF)
+When a user asks a question, the system queries ChromaDB (Vector) and SQLite (FTS5) simultaneously. It pulls the Top 15 chunks from both engines. 
 
-### 2. Query & Retrieval
+Before fusion, a **Dynamic Drop-off Gate** inspects the raw vector distances. If scores fall off a cliff (e.g. < 70% of the top match) or are objectively terrible, they are incinerated instantly ("Null over Hallucination"). The remaining chunks are mathematically fused using the industry-standard RRF algorithm (`k=60`). The final absolute Top 5 unique parent contexts are passed to the LLM.
 
-```
-User Question → Generate Query Embedding → Cosine Similarity Search → Top-K Chunks
-```
+---
 
-- The user's question is embedded using the same model.
-- ChromaDB performs cosine similarity search to find the most relevant chunks.
-- Top 6 chunks are retrieved along with their similarity scores.
+## 🚧 Known Limitations & Roadmap
 
-### 3. Answer Generation
+While the architecture is highly advanced, a true production deployment requires addressing the following edge cases:
 
-```
-System Prompt + Retrieved Chunks + User Query → Gemini LLM → Streamed Answer with Citations
-```
-
-- A carefully crafted system prompt instructs the LLM to:
-  - Answer **only** from the provided context
-  - Cite sources with `[Page X]` notation
-  - Use clear, structured markdown formatting
-- The response is streamed token-by-token via SSE for a real-time experience.
+1. **Tabular Data (XLSX/CSV) Chunking:** Currently, `MarkItDown` converts spreadsheets to Markdown tables, which are then passed through the standard 400-char parent-child chunker. This risks silently breaking rows mid-chunk for heavy tabular data (e.g., ILMT reports). *Roadmap:* Implement row-wise chunking specifically for spreadsheets to preserve row integrity and column headers.
+2. **Scanned Documents (OCR):** `PyMuPDF` is exceptionally fast for digital PDFs but lacks built-in OCR. Scanned signed contracts will extract as empty or garbled text. *Roadmap:* Implement a Tesseract or cloud OCR fallback path for image-based PDFs.
+3. **Advanced Error Recovery:** While password-protected or corrupted files are caught and rejected gracefully, partial failures (e.g., extracting 50 out of 100 pages before corruption) should support partial ingestion states.
 
 ---
 
@@ -101,7 +104,7 @@ System Prompt + Retrieved Chunks + User Query → Gemini LLM → Streamed Answer
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.13
 - Google Gemini API key ([get free at aistudio.google.com](https://aistudio.google.com))
 
 ### Setup
@@ -128,70 +131,10 @@ python main.py
 ```
 
 ### Open in Browser
-
-Navigate to **http://localhost:8000** — that's it!
-
----
-
-## 📡 API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/` | Serve frontend |
-| `GET` | `/health` | Health check |
-| `POST` | `/api/upload` | Upload PDF/TXT file |
-| `POST` | `/api/chat` | Chat with SSE streaming |
-| `GET` | `/api/documents` | List all documents |
-| `DELETE` | `/api/documents/{id}` | Delete a document |
-
-### Upload Example
-
-```bash
-curl -X POST http://localhost:8000/api/upload \
-  -F "file=@document.pdf"
-```
-
-### Chat Example
-
-```bash
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is the main topic?", "document_id": "..."}'
-```
-
----
-
-## 📁 Project Structure
-
-```
-Portfolio/
-├── backend/
-│   ├── main.py              # FastAPI server & routes
-│   ├── rag_engine.py         # RAG pipeline (parse, chunk, embed, retrieve, generate)
-│   ├── requirements.txt      # Python dependencies
-│   └── vector_store/         # Persistent vector store (auto-created)
-├── frontend/
-│   ├── index.html            # Main HTML page
-│   ├── style.css             # Premium dark theme CSS
-│   └── app.js                # Client-side logic
-├── .env.example              # Environment variable template
-├── .env                      # Your API key (not committed)
-└── README.md                 # This file
-```
-
----
-
-## 🎨 Design Highlights
-
-- **Dark Mode**: Deep, rich dark palette with purple-blue gradient accents
-- **Glassmorphism**: Frosted glass effects on headers and input areas
-- **Micro-Animations**: Floating upload icon, typing indicators, message entrance animations
-- **Responsive Layout**: Collapsible sidebar on mobile, adaptive chat area
-- **Custom Scrollbar**: Styled to match the dark theme
-- **Toast Notifications**: Animated success/error/info feedback
+Navigate to **http://localhost:8000**
 
 ---
 
 ## 📝 License
 
-MIT — built for educational purposes.
+MIT — built for educational purposes and enterprise architectural demonstrations.

@@ -1,5 +1,5 @@
 // ────────────────────────────────────────────────────────────
-//  DocuMind AI — Frontend Application Logic
+//  Needle AI — Frontend Application Logic
 // ────────────────────────────────────────────────────────────
 
 const API_BASE = window.location.origin;
@@ -21,7 +21,9 @@ const dom = {
   sidebar: $(".sidebar"),
   sidebarOverlay: $(".sidebar-overlay"),
   sidebarToggle: $(".sidebar-toggle"),
-  uploadZone: $(".upload-zone"),
+  newDocBtn: $("#new-doc-btn"),
+  attachBtn: $("#attach-btn"),
+  dropOverlay: $("#drop-overlay"),
   uploadInput: $("#file-upload"),
   uploadProgress: $(".upload-progress"),
   progressFill: $(".progress-fill"),
@@ -52,40 +54,49 @@ document.addEventListener("DOMContentLoaded", () => {
 
 // ── Upload Logic ────────────────────────────────────────────
 function initUpload() {
-  const zone = dom.uploadZone;
   const input = dom.uploadInput;
 
-  // Click to upload
-  zone.addEventListener("click", () => input.click());
+  if(dom.newDocBtn) dom.newDocBtn.addEventListener("click", () => input.click());
+  if(dom.attachBtn) dom.attachBtn.addEventListener("click", () => input.click());
 
-  // File selected
   input.addEventListener("change", (e) => {
     if (e.target.files.length > 0) uploadFile(e.target.files[0]);
   });
 
-  // Drag and drop
-  zone.addEventListener("dragover", (e) => {
+  // Full-Screen Drag and Drop
+  let dragCounter = 0;
+  
+  window.addEventListener("dragenter", (e) => {
     e.preventDefault();
-    zone.classList.add("drag-over");
+    dragCounter++;
+    if(dom.dropOverlay) dom.dropOverlay.classList.remove("hidden");
   });
 
-  zone.addEventListener("dragleave", () => {
-    zone.classList.remove("drag-over");
+  window.addEventListener("dragover", (e) => {
+    e.preventDefault();
   });
 
-  zone.addEventListener("drop", (e) => {
+  window.addEventListener("dragleave", () => {
+    dragCounter--;
+    if (dragCounter === 0) {
+      if(dom.dropOverlay) dom.dropOverlay.classList.add("hidden");
+    }
+  });
+
+  window.addEventListener("drop", (e) => {
     e.preventDefault();
-    zone.classList.remove("drag-over");
+    dragCounter = 0;
+    if(dom.dropOverlay) dom.dropOverlay.classList.add("hidden");
     if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
   });
 }
 
 async function uploadFile(file) {
   // Validate
-  const allowedExtensions = [".pdf", ".txt", ".md", ".text"];
+  const allowedExtensions = [".pdf", ".txt", ".md", ".text", ".docx", ".pptx"];
   const ext = "." + file.name.split(".").pop().toLowerCase();
   if (!allowedExtensions.includes(ext)) {
-    showToast("Please upload a PDF or text file.", "error");
+    showToast("Please upload a valid document format.", "error");
     return;
   }
 
@@ -102,14 +113,12 @@ async function uploadFile(file) {
   // Animate progress (indeterminate feel)
   let progress = 0;
   const progressInterval = setInterval(() => {
-    progress += Math.random() * 15;
+    progress += Math.random() * 5;
     if (progress > 85) progress = 85;
     dom.progressFill.style.width = progress + "%";
-  }, 300);
+  }, 500);
 
   try {
-    dom.progressText.textContent = "Processing & embedding chunks...";
-
     const formData = new FormData();
     formData.append("file", file);
 
@@ -118,14 +127,37 @@ async function uploadFile(file) {
       body: formData,
     });
 
-    clearInterval(progressInterval);
-
     if (!response.ok) {
       const err = await response.json();
       throw new Error(err.detail || "Upload failed");
     }
 
     const data = await response.json();
+    const taskId = data.task_id;
+    
+    dom.progressText.textContent = "Processing large file (this may take a few minutes)...";
+    
+    // Poll for status
+    let isCompleted = false;
+    let docData = null;
+    
+    while (!isCompleted) {
+        await new Promise(r => setTimeout(r, 2000)); // Poll every 2 seconds
+        
+        const statusRes = await fetch(`${API_BASE}/api/upload/status/${taskId}`);
+        if (!statusRes.ok) throw new Error("Failed to check upload status.");
+        
+        const statusData = await statusRes.json();
+        
+        if (statusData.status === "completed") {
+            isCompleted = true;
+            docData = statusData;
+        } else if (statusData.status === "failed") {
+            throw new Error(statusData.error || "Processing failed on server.");
+        }
+    }
+
+    clearInterval(progressInterval);
 
     // Complete progress
     dom.progressFill.style.width = "100%";
@@ -136,11 +168,11 @@ async function uploadFile(file) {
       dom.progressFill.style.width = "0%";
     }, 1500);
 
-    showToast(data.message, "success");
+    showToast(docData.message, "success");
 
-    // Reload documents and select the new one
+    // Reload documents and keep global selected
     await loadDocuments();
-    selectDocument(data.document.id);
+    selectGlobal();
 
   } catch (err) {
     clearInterval(progressInterval);
@@ -180,7 +212,13 @@ function renderDocumentList() {
     li.className = `doc-item${doc.id === state.activeDocumentId ? " active" : ""}`;
     li.dataset.id = doc.id;
 
-    const icon = doc.name.toLowerCase().endsWith(".pdf") ? "📄" : "📝";
+    let icon = "📝";
+    const lowerName = doc.name.toLowerCase();
+    if (lowerName.endsWith(".pdf")) icon = "📄";
+    else if (lowerName.endsWith(".docx") || lowerName.endsWith(".doc")) icon = "📘";
+    else if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".csv")) icon = "📊";
+    else if (lowerName.endsWith(".pptx")) icon = "📽️";
+    
     const pages = doc.max_page || "?";
     const chunks = doc.chunk_count || "?";
 
@@ -198,6 +236,20 @@ function renderDocumentList() {
   });
 }
 
+function selectGlobal() {
+  state.activeDocumentId = null;
+  $$(".doc-item").forEach(el => el.classList.remove("active"));
+  const globalBtn = $("#global-chat-btn");
+  if(globalBtn) {
+    globalBtn.classList.add("active");
+  }
+  
+  dom.activeDocBadge.classList.remove("hidden");
+  dom.activeDocName.textContent = "Global Database";
+  dom.chatInput.placeholder = "Ask a question across all documents...";
+  dom.chatInput.focus();
+}
+
 function selectDocument(docId) {
   state.activeDocumentId = docId;
   const doc = state.documents.find((d) => d.id === docId);
@@ -206,6 +258,11 @@ function selectDocument(docId) {
   $$(".doc-item").forEach((el) => {
     el.classList.toggle("active", el.dataset.id === docId);
   });
+  
+  const globalBtn = $("#global-chat-btn");
+  if(globalBtn) {
+    globalBtn.classList.remove("active");
+  }
 
   if (doc) {
     dom.activeDocBadge.classList.remove("hidden");
@@ -396,8 +453,8 @@ function appendSources(messageEl, sources) {
     .map(
       (s, i) => `
     <button class="source-chip" onclick="toggleSourceDetail(this, ${i})" data-source-index="${i}">
-      📄 Page ${s.page_number}
-      <span class="chip-score">${Math.round(s.similarity_score * 100)}%</span>
+      📄 ${s.header_context ? `[${s.header_context}]` : `Page ${s.page_number}`}
+      <span class="chip-score">${Math.round(s.similarity_score)} RRF</span>
     </button>`
     )
     .join("");
@@ -407,7 +464,7 @@ function appendSources(messageEl, sources) {
       (s, i) => `
     <div class="source-detail" id="source-detail-${i}">
       <div class="source-detail-header">
-        <span>📄 ${escapeHtml(s.document_name)} — Page ${s.page_number}</span>
+        <span>📄 ${escapeHtml(s.document_name)} ${s.header_context ? `— Section: ${s.header_context}` : `— Page ${s.page_number}`}</span>
         <button class="source-detail-close" onclick="this.closest('.source-detail').classList.remove('active')">✕</button>
       </div>
       <div>${escapeHtml(s.text)}</div>
@@ -416,7 +473,7 @@ function appendSources(messageEl, sources) {
     .join("");
 
   sourcesEl.innerHTML = `
-    <div class="sources-label">📌 Sources used</div>
+    <div class="sources-label">📌 Sources retrieved via Hybrid Search</div>
     <div class="sources-chips">${chips}</div>
     ${details}
   `;
@@ -446,8 +503,12 @@ function initSidebar() {
 
   if (toggle) {
     toggle.addEventListener("click", () => {
-      dom.sidebar.classList.toggle("open");
-      overlay.classList.toggle("active");
+      if (window.innerWidth <= 768) {
+        dom.sidebar.classList.toggle("open");
+        overlay.classList.toggle("active");
+      } else {
+        dom.sidebar.classList.toggle("collapsed");
+      }
     });
   }
 
@@ -456,6 +517,11 @@ function initSidebar() {
       dom.sidebar.classList.remove("open");
       overlay.classList.remove("active");
     });
+  }
+
+  const globalBtn = $("#global-chat-btn");
+  if (globalBtn) {
+    globalBtn.addEventListener("click", selectGlobal);
   }
 }
 

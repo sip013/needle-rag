@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .env
 backend/vector_store/
+backend/chroma_store/
+temp_*
 .vscode/

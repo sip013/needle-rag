@@ -1,50 +1,70 @@
-# ──────────────────────────────────────────────────────────────
-#  RAG Engine — Document parsing, chunking, embedding & retrieval
-#  Uses a custom numpy-based vector store (zero compilation deps)
-# ──────────────────────────────────────────────────────────────
-import os, uuid, re, textwrap, json, io, threading
+import os, uuid, textwrap, json, re, sqlite3
 from typing import List, Dict, Any, Optional, Generator
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
 
-import numpy as np
-from pypdf import PdfReader
+import chromadb
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
+
+# New imports for parsing and chunking
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+from markitdown import MarkItDown
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 # ── Configuration ────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-EMBEDDING_MODEL = "gemini-embedding-2"
 GENERATION_MODEL = "gemini-2.5-flash"
-CHUNK_SIZE = 800          # characters per chunk
-CHUNK_OVERLAP = 200       # overlap between chunks
-TOP_K = 6                 # number of chunks to retrieve
-STORE_DIR = os.path.join(os.path.dirname(__file__), "vector_store")
 
-# ── Gemini Client ────────────────────────────────────────────
+# SOTA: Parent-Child Chunking
+PARENT_CHUNK_SIZE = 2000
+PARENT_CHUNK_OVERLAP = 200
+CHILD_CHUNK_SIZE = 400
+CHILD_CHUNK_OVERLAP = 50
+TOP_K_CHILDREN = 15 # Retrieve 15 from Vector, 15 from Keyword, then RRF
+
+STORE_DIR = os.path.join(os.path.dirname(__file__), "chroma_store")
+if not os.path.exists(STORE_DIR):
+    os.makedirs(STORE_DIR)
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ── ChromaDB Setup (Vector Search) ───────────────────────────
+chroma_client = chromadb.PersistentClient(path=STORE_DIR)
+collection = chroma_client.get_or_create_collection(
+    name="documind_sota_local",
+    metadata={"hnsw:space": "cosine"}
+)
 
-# ── Data Classes ─────────────────────────────────────────────
-@dataclass
-class Chunk:
-    text: str
-    page_number: int          # 1-indexed; 0 = unknown
-    chunk_index: int
-    document_id: str
-    document_name: str
+# ── SQLite FTS5 Setup (Keyword Search) ───────────────────────
+sqlite_path = os.path.join(STORE_DIR, "bm25_index.db")
+conn = sqlite3.connect(sqlite_path, check_same_thread=False)
+# FTS5 uses a completely virtual table optimized for full text search
+conn.execute('''
+    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+        document_id UNINDEXED, 
+        chunk_id UNINDEXED, 
+        document_name UNINDEXED,
+        page_number UNINDEXED,
+        header_context UNINDEXED,
+        parent_text,
+        tokenize="porter"
+    )
+''')
+conn.commit()
 
 @dataclass
 class RetrievedChunk:
-    text: str
+    text: str # Parent text for maximum context
     page_number: int
     chunk_index: int
     document_id: str
     document_name: str
-    similarity_score: float   # 0-1 (higher = more relevant)
+    header_context: str
+    similarity_score: float # Final RRF score
 
 @dataclass
 class DocumentInfo:
@@ -53,393 +73,293 @@ class DocumentInfo:
     num_chunks: int
     num_pages: int
     file_type: str
-    uploaded_at: str          # ISO timestamp
+    uploaded_at: str
 
 
-# ══════════════════════════════════════════════════════════════
-#  Custom Numpy Vector Store
-# ══════════════════════════════════════════════════════════════
+# ── Metadata Scaffolding ─────────────────────────────────────
+headers_to_split_on = [
+    ("#", "Header 1"),
+    ("##", "Header 2"),
+    ("###", "Header 3"),
+    ("####", "Header 4"),
+]
+md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
 
-class NumpyVectorStore:
-    """
-    A lightweight, persistent vector store using numpy for cosine similarity.
-    Stores embeddings as .npy files and metadata as JSON.
-    Thread-safe with a read-write lock.
-    """
 
-    def __init__(self, store_dir: str):
-        self.store_dir = store_dir
-        Path(store_dir).mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._load()
-
-    def _meta_path(self) -> str:
-        return os.path.join(self.store_dir, "metadata.json")
-
-    def _emb_path(self) -> str:
-        return os.path.join(self.store_dir, "embeddings.npy")
-
-    def _load(self):
-        """Load existing store from disk."""
-        meta_path = self._meta_path()
-        emb_path = self._emb_path()
-
-        if os.path.exists(meta_path) and os.path.exists(emb_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                self._metadata: List[Dict[str, Any]] = json.load(f)
-            self._embeddings: np.ndarray = np.load(emb_path)
+# ── Document parsing & Chunking ──────────────────────────────
+def process_document(
+    file_bytes: bytes,
+    filename: str,
+    file_type: str,
+) -> DocumentInfo:
+    document_id = str(uuid.uuid4())
+    temp_path = f"temp_{document_id}_{filename}"
+    with open(temp_path, "wb") as f:
+        f.write(file_bytes)
+        
+    try:
+        docs = []
+        full_text = ""
+        
+        # 1. Parsing and Metadata Scaffolding
+        md_splits = []
+        if file_type == "application/pdf" or filename.lower().endswith(".pdf"):
+            loader = PyMuPDFLoader(temp_path)
+            raw_docs = loader.load()
+            ftype = "pdf"
+            num_pages = len(raw_docs)
+            if num_pages == 0:
+                raise ValueError("No text could be extracted.")
+            # Process page by page to keep exact page numbers
+            for d in raw_docs:
+                page_text = d.page_content.strip()
+                if not page_text:
+                    continue
+                page_splits = md_splitter.split_text(page_text)
+                for split in page_splits:
+                    # PyMuPDF uses 0-indexed page in metadata
+                    split.metadata["page"] = d.metadata.get("page", 0) + 1
+                    md_splits.append(split)
         else:
-            self._metadata = []
-            self._embeddings = np.empty((0, 0), dtype=np.float32)
-
-    def _save(self):
-        """Persist store to disk."""
-        with open(self._meta_path(), "w", encoding="utf-8") as f:
-            json.dump(self._metadata, f, ensure_ascii=False)
-        if self._embeddings.size > 0:
-            np.save(self._emb_path(), self._embeddings)
-
-    def add(
-        self,
-        texts: List[str],
-        embeddings: List[List[float]],
-        metadatas: List[Dict[str, Any]],
-    ):
-        """Add documents with embeddings and metadata."""
-        with self._lock:
-            new_embs = np.array(embeddings, dtype=np.float32)
-
-            if self._embeddings.size == 0:
-                self._embeddings = new_embs
-            else:
-                self._embeddings = np.vstack([self._embeddings, new_embs])
-
-            for i, text in enumerate(texts):
-                entry = {**metadatas[i], "text": text}
-                self._metadata.append(entry)
-
-            self._save()
-
-    def search(
-        self,
-        query_embedding: List[float],
-        top_k: int = 5,
-        where: Optional[Dict[str, str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Cosine similarity search. Returns top-k results with scores."""
-        with self._lock:
-            if self._embeddings.size == 0 or len(self._metadata) == 0:
-                return []
-
-            # Filter by metadata if needed
-            if where:
-                indices = []
-                for i, meta in enumerate(self._metadata):
-                    match = all(meta.get(k) == v for k, v in where.items())
-                    if match:
-                        indices.append(i)
-                if not indices:
-                    return []
-                filtered_embs = self._embeddings[indices]
-                filtered_meta = [self._metadata[i] for i in indices]
-            else:
-                filtered_embs = self._embeddings
-                filtered_meta = self._metadata
-
-            # Cosine similarity
-            query_vec = np.array(query_embedding, dtype=np.float32)
-            query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
-
-            norms = np.linalg.norm(filtered_embs, axis=1, keepdims=True) + 1e-10
-            normed_embs = filtered_embs / norms
-
-            similarities = normed_embs @ query_norm  # dot product of unit vectors
-
-            # Get top-k
-            k = min(top_k, len(similarities))
-            top_indices = np.argsort(similarities)[-k:][::-1]
-
-            results = []
-            for idx in top_indices:
-                score = float(similarities[idx])
-                if score > 0:
-                    results.append({
-                        **filtered_meta[idx],
-                        "similarity_score": round(score, 4),
-                    })
-
-            return results
-
-    def get_all_metadata(self) -> List[Dict[str, Any]]:
-        """Get all metadata entries."""
-        with self._lock:
-            return list(self._metadata)
-
-    def delete_by(self, key: str, value: str) -> bool:
-        """Delete all entries matching key=value. Returns True if any deleted."""
-        with self._lock:
-            indices_to_keep = []
-            deleted = False
-            for i, meta in enumerate(self._metadata):
-                if meta.get(key) == value:
-                    deleted = True
-                else:
-                    indices_to_keep.append(i)
-
-            if not deleted:
-                return False
-
-            self._metadata = [self._metadata[i] for i in indices_to_keep]
-            if indices_to_keep and self._embeddings.size > 0:
-                self._embeddings = self._embeddings[indices_to_keep]
-            else:
-                self._embeddings = np.empty((0, 0), dtype=np.float32)
-
-            self._save()
-            return True
-
-
-# ── Initialize Vector Store ──────────────────────────────────
-vector_store = NumpyVectorStore(STORE_DIR)
-
-
-# ── Text Extraction ──────────────────────────────────────────
-
-def extract_text_from_pdf(file_bytes: bytes) -> List[Dict[str, Any]]:
-    """Extract text from PDF, returning list of {page, text}."""
-    reader = PdfReader(io.BytesIO(file_bytes))
-    pages = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        if text.strip():
-            pages.append({"page": i + 1, "text": text.strip()})
-    return pages
-
-
-def extract_text_from_txt(file_bytes: bytes) -> List[Dict[str, Any]]:
-    """Extract text from plain text file."""
-    text = file_bytes.decode("utf-8", errors="replace")
-    # Treat every ~3000 chars as a "page" for citation purposes
-    page_size = 3000
-    pages = []
-    for i in range(0, len(text), page_size):
-        chunk = text[i : i + page_size].strip()
-        if chunk:
-            pages.append({"page": i // page_size + 1, "text": chunk})
-    return pages
-
-
-# ── Smart Chunking ───────────────────────────────────────────
-
-def chunk_text(
-    pages: List[Dict[str, Any]],
-    document_id: str,
-    document_name: str,
-    chunk_size: int = CHUNK_SIZE,
-    chunk_overlap: int = CHUNK_OVERLAP,
-) -> List[Chunk]:
-    """
-    Recursive character text splitting with overlap.
-    Preserves page-number metadata for each chunk.
-    """
-    chunks: List[Chunk] = []
-    chunk_index = 0
-
-    for page_info in pages:
-        page_num = page_info["page"]
-        text = page_info["text"]
-
-        # Split by paragraphs first, then by sentences, then by chars
-        segments = _recursive_split(text, chunk_size)
-
-        i = 0
-        while i < len(segments):
-            start_i = i
-            # Accumulate segments up to chunk_size
-            current = ""
-            while i < len(segments) and len(current) + len(segments[i]) + 1 <= chunk_size:
-                current += (" " if current else "") + segments[i]
-                i += 1
-
-            if not current.strip():
-                i += 1
-                continue
-
-            chunks.append(Chunk(
-                text=current.strip(),
-                page_number=page_num,
-                chunk_index=chunk_index,
-                document_id=document_id,
-                document_name=document_name,
-            ))
-            chunk_index += 1
-
-            # Apply overlap: back up so next chunk overlaps
-            if chunk_overlap > 0 and i < len(segments):
-                overlap_chars = 0
-                backup = 0
-                for j in range(i - 1, -1, -1):
-                    overlap_chars += len(segments[j])
-                    backup += 1
-                    if overlap_chars >= chunk_overlap:
-                        break
-                
-                # Prevent infinite loops by ensuring strict forward progress
-                new_i = i - backup
-                if new_i <= start_i:
-                    new_i = start_i + 1
-                i = new_i
-
-    return chunks
-
-
-def _recursive_split(text: str, max_size: int) -> List[str]:
-    """Split text recursively: paragraphs → sentences → hard splits."""
-    # Try paragraph splits
-    paragraphs = re.split(r"\n\s*\n", text)
-    if len(paragraphs) > 1:
-        result = []
-        for p in paragraphs:
-            p = p.strip()
-            if not p:
-                continue
-            if len(p) <= max_size:
-                result.append(p)
-            else:
-                result.extend(_recursive_split(p, max_size))
-        return result
-
-    # Try sentence splits
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    if len(sentences) > 1:
-        result = []
-        for s in sentences:
-            s = s.strip()
-            if not s:
-                continue
-            if len(s) <= max_size:
-                result.append(s)
-            else:
-                result.extend(_hard_split(s, max_size))
-        return result
-
-    # Hard split as last resort
-    return _hard_split(text, max_size)
-
-
-def _hard_split(text: str, max_size: int) -> List[str]:
-    """Hard-split text into max_size character pieces at word boundaries."""
-    words = text.split()
-    result = []
-    current = ""
-    for word in words:
-        if len(current) + len(word) + 1 <= max_size:
-            current += (" " if current else "") + word
-        else:
-            if current:
-                result.append(current)
-            current = word
-    if current:
-        result.append(current)
-    return result
-
-
-# ── Embedding & Storage ──────────────────────────────────────
-
-def generate_embeddings(texts: List[str]) -> List[List[float]]:
-    """Generate embeddings for a list of texts using Gemini."""
-    embeddings = []
-    # Batch in groups of 100 (API limit)
-    batch_size = 100
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        result = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=batch,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-            ),
+            # MarkItDown for DOCX, PPTX, XLSX, Images, etc.
+            md = MarkItDown()
+            result = md.convert(temp_path)
+            full_text = result.text_content
+            if not full_text.strip():
+                raise ValueError("No text could be extracted.")
+            ftype = "multimodal"
+            num_pages = 1
+            md_splits = md_splitter.split_text(full_text)
+            for split in md_splits:
+                split.metadata["page"] = 1
+        
+        # 3. Parent-Child Chunking
+        parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=PARENT_CHUNK_SIZE,
+            chunk_overlap=PARENT_CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ".", " ", ""]
         )
-        for emb in result.embeddings or []:
-            embeddings.append(emb.values)
-    return embeddings
+        child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHILD_CHUNK_SIZE,
+            chunk_overlap=CHILD_CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ".", " ", ""]
+        )
+        
+        parent_chunks = parent_splitter.split_documents(md_splits)
+        if not parent_chunks:
+            raise ValueError("No meaningful text chunks could be created.")
+            
+        ids = []
+        texts = []
+        metadatas = []
+        
+        # Prepare FTS inserts
+        fts_data = []
+        
+        total_children = 0
+        for p_idx, parent in enumerate(parent_chunks):
+            # Extract header context
+            h1 = parent.metadata.get("Header 1", "")
+            h2 = parent.metadata.get("Header 2", "")
+            h3 = parent.metadata.get("Header 3", "")
+            header_context = " > ".join(filter(None, [h1, h2, h3]))
+            
+            children = child_splitter.split_text(parent.page_content)
+            
+            for c_idx, child_text in enumerate(children):
+                child_id = f"{document_id}_{p_idx}_{c_idx}"
+                ids.append(child_id)
+                texts.append(child_text) # Embed the highly specific child
+                
+                page_num = parent.metadata.get("page", 1)
+                
+                meta = {
+                    "document_id": document_id,
+                    "document_name": filename,
+                    "page_number": page_num,
+                    "chunk_index": p_idx,
+                    "parent_text": parent.page_content, # Store the massive context
+                    "header_context": header_context # Scaffolding metadata
+                }
+                metadatas.append(meta)
+                
+                # Add to FTS data
+                fts_data.append((document_id, child_id, filename, page_num, header_context, parent.page_content))
+                total_children += 1
+                
+        # Insert into ChromaDB (Vector Search)
+        for i in range(0, len(ids), 500):
+            collection.add(
+                ids=ids[i:i+500],
+                documents=texts[i:i+500],
+                metadatas=metadatas[i:i+500]
+            )
+            
+        # Insert into SQLite FTS5 (Keyword Search)
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT INTO documents_fts (document_id, chunk_id, document_name, page_number, header_context, parent_text) VALUES (?, ?, ?, ?, ?, ?)",
+            fts_data
+        )
+        conn.commit()
+            
+        return DocumentInfo(
+            id=document_id,
+            name=filename,
+            num_chunks=total_children,
+            num_pages=num_pages,
+            file_type=ftype,
+            uploaded_at=datetime.now(timezone.utc).isoformat(),
+        )
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-def store_chunks(chunks: List[Chunk]) -> None:
-    """Store chunks with embeddings in the vector store."""
-    if not chunks:
-        return
-
-    texts = [c.text for c in chunks]
-    embeddings = generate_embeddings(texts)
-
-    metadatas = [
-        {
-            "document_id": c.document_id,
-            "document_name": c.document_name,
-            "page_number": c.page_number,
-            "chunk_index": c.chunk_index,
-        }
-        for c in chunks
-    ]
-
-    vector_store.add(
-        texts=texts,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
+def get_all_documents() -> List[Dict[str, Any]]:
+    # Instead of fetching heavy metadata from Chroma, we can query SQLite for distinct docs
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT document_id, document_name FROM documents_fts")
+    rows = cursor.fetchall()
+    
+    docs = []
+    for doc_id, name in rows:
+        cursor.execute("SELECT COUNT(*), MAX(page_number) FROM documents_fts WHERE document_id = ?", (doc_id,))
+        count, max_page = cursor.fetchone()
+        docs.append({
+            "id": doc_id,
+            "name": name,
+            "chunk_count": count,
+            "max_page": max_page or 1,
+        })
+    return docs
 
 
-# ── Retrieval ────────────────────────────────────────────────
+def delete_document(document_id: str) -> bool:
+    collection.delete(where={"document_id": document_id})
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
+    conn.commit()
+    return True
 
-def retrieve_chunks(
-    query: str,
-    document_id: Optional[str] = None,
-    top_k: int = TOP_K,
-) -> List[RetrievedChunk]:
-    """Retrieve the most relevant chunks for a query."""
-    # Generate query embedding
-    result = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=[query],
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY",
-        ),
-    )
-    if not result.embeddings:
-        raise ValueError("Failed to generate embedding for the query.")
-    query_embedding = result.embeddings[0].values
-    if query_embedding is None:
-        raise ValueError("Embedding values are None for the query.")
 
-    # Build where filter
-    where_filter = None
-    if document_id:
-        where_filter = {"document_id": document_id}
-
-    # Search vector store
-    results = vector_store.search(
-        query_embedding=query_embedding,
-        top_k=top_k,
+# ── Hybrid Search & RRF ──────────────────────────────────────
+def retrieve_chunks(query: str, document_id: Optional[str] = None) -> List[RetrievedChunk]:
+    where_filter = {"document_id": document_id} if document_id else None
+    
+    # 1. VECTOR SEARCH (ChromaDB)
+    vector_results = collection.query(
+        query_texts=[query],
+        n_results=TOP_K_CHILDREN,
         where=where_filter,
+        include=["documents", "metadatas", "distances"]
     )
-
+    
+    vector_scores = {}
+    if vector_results["documents"] and len(vector_results["documents"][0]) > 0:
+        docs = vector_results["documents"][0]
+        metas = vector_results["metadatas"][0]
+        dists = vector_results["distances"][0]
+        
+        sims = [1.0 - d for d in dists]
+        if sims:
+            top_sim = max(sims)
+            for rank, (doc, meta, sim) in enumerate(zip(docs, metas, sims)):
+                # DYNAMIC GATE: "Null over Hallucination"
+                # 1. If similarity falls off a cliff (< 70% of the top match), it lacks consensus.
+                # 2. If it's objectively terrible (sim < 0.1), discard immediately.
+                if sim < (top_sim * 0.7) or sim < 0.1:
+                    continue
+                    
+                p_id = f"{meta['document_id']}_{meta['chunk_index']}"
+                if p_id not in vector_scores:
+                    vector_scores[p_id] = {
+                        "rank": rank + 1,
+                        "meta": meta
+                    }
+                
+    # 2. KEYWORD SEARCH (SQLite FTS5)
+    # Convert query to FTS Match syntax (OR between alphanumeric words)
+    words = [w for w in re.findall(r'\w+', query.lower()) if len(w) > 2]
+    fts_query = " OR ".join(words)
+    
+    keyword_scores = {}
+    if fts_query:
+        cursor = conn.cursor()
+        sql = """
+            SELECT document_id, chunk_id, document_name, page_number, header_context, parent_text, bm25(documents_fts) as score
+            FROM documents_fts 
+            WHERE documents_fts MATCH ? 
+        """
+        params = [fts_query]
+        if document_id:
+            sql += " AND document_id = ?"
+            params.append(document_id)
+        sql += " ORDER BY score ASC LIMIT ?"
+        params.append(TOP_K_CHILDREN)
+        
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        
+        for rank, row in enumerate(rows):
+            doc_id, chunk_id, doc_name, page, header_ctx, p_text, bm25_score = row
+            # Extract p_idx from chunk_id (format: docid_pidx_cidx)
+            p_idx = chunk_id.split('_')[-2]
+            p_id = f"{doc_id}_{p_idx}"
+            
+            if p_id not in keyword_scores:
+                keyword_scores[p_id] = {
+                    "rank": rank + 1,
+                    "meta": {
+                        "document_id": doc_id,
+                        "document_name": doc_name,
+                        "page_number": page,
+                        "chunk_index": p_idx,
+                        "parent_text": p_text,
+                        "header_context": header_ctx
+                    }
+                }
+                
+    # 3. RECIPROCAL RANK FUSION (RRF)
+    # RRF Score = 1 / (k + rank)
+    k = 60
+    final_scores = {}
+    combined_meta = {}
+    
+    all_p_ids = set(vector_scores.keys()).union(set(keyword_scores.keys()))
+    
+    for p_id in all_p_ids:
+        score = 0.0
+        if p_id in vector_scores:
+            score += 1.0 / (k + vector_scores[p_id]["rank"])
+            combined_meta[p_id] = vector_scores[p_id]["meta"]
+        if p_id in keyword_scores:
+            score += 1.0 / (k + keyword_scores[p_id]["rank"])
+            combined_meta[p_id] = keyword_scores[p_id]["meta"]
+            
+        final_scores[p_id] = score
+        
+    # Sort by RRF score descending
+    sorted_p_ids = sorted(final_scores.keys(), key=lambda x: final_scores[x], reverse=True)
+    
     retrieved = []
-    for r in results:
+    # Return top 5 most relevant fused parent contexts
+    for p_id in sorted_p_ids[:5]:
+        meta = combined_meta[p_id]
         retrieved.append(RetrievedChunk(
-            text=r.get("text", ""),
-            page_number=r.get("page_number", 0),
-            chunk_index=r.get("chunk_index", 0),
-            document_id=r.get("document_id", ""),
-            document_name=r.get("document_name", ""),
-            similarity_score=r.get("similarity_score", 0.0),
+            text=meta.get("parent_text", ""),
+            page_number=meta.get("page_number", 0),
+            chunk_index=int(meta.get("chunk_index", 0)),
+            document_id=meta.get("document_id", ""),
+            document_name=meta.get("document_name", ""),
+            header_context=meta.get("header_context", ""),
+            similarity_score=final_scores[p_id]
         ))
-
+        
     return retrieved
 
 
-# ── Generation (Streaming) ───────────────────────────────────
-
+# ── Generation ───────────────────────────────────────────────
 SYSTEM_PROMPT = textwrap.dedent("""\
 You are an intelligent document assistant. Your job is to answer questions
 based ONLY on the provided context from uploaded documents.
@@ -447,156 +367,59 @@ based ONLY on the provided context from uploaded documents.
 Rules:
 1. Answer based on the provided context. If the context doesn't contain
    enough information, say so clearly.
-2. Always cite your sources using page numbers like: [Page X].
+2. The context includes document hierarchy/chapters (e.g., [Section: Introduction > Safety]). 
+   Use this to organize your answer if helpful.
 3. Be precise, helpful, and well-structured in your answers.
 4. Use markdown formatting for readability (headers, lists, bold, etc.).
 5. If multiple sources are relevant, synthesize them into a coherent answer.
 6. Never make up information not present in the context.
 """)
 
-
-def build_context_prompt(chunks: List[RetrievedChunk], query: str) -> str:
-    """Build the prompt with retrieved context."""
+def build_context_prompt(chunks: List[RetrievedChunk], query: str, available_docs: List[Dict[str, Any]]) -> str:
+    # Build list of all documents in the database
+    doc_list_str = "\n".join([f"- {d['name']} ({d['max_page']} pages)" for d in available_docs])
+    
     context_parts = []
     for i, chunk in enumerate(chunks):
-        source_label = f"Source {i+1} (Page {chunk.page_number}, {chunk.document_name})"
+        header_info = f" [Section: {chunk.header_context}]" if chunk.header_context else ""
+        source_label = f"Source {i+1} ({chunk.document_name}{header_info})"
         context_parts.append(f"--- {source_label} ---\n{chunk.text}")
-
     context_str = "\n\n".join(context_parts)
+    
+    return f"AVAILABLE DOCUMENTS IN DATABASE:\n{doc_list_str}\n\nCONTEXT FROM DOCUMENTS:\n{context_str}\n\nUSER QUESTION:\n{query}\n\nPlease answer the question based on the context above. Cite your sources."
 
-    return f"""CONTEXT FROM DOCUMENTS:
-{context_str}
-
-USER QUESTION:
-{query}
-
-Please answer the question based on the context above. Cite page numbers using [Page X] notation."""
-
-
-def generate_answer_stream(
-    query: str,
-    document_id: Optional[str] = None,
-) -> Generator[str, None, None]:
-    """
-    Retrieve relevant chunks and stream the LLM response.
-    Yields JSON strings: {"type": "chunk", "content": "..."} or
-                          {"type": "sources", "data": [...]}
-    """
-    # 1. Retrieve relevant chunks
+def generate_answer_stream(query: str, document_id: Optional[str] = None) -> Generator[str, None, None]:
     chunks = retrieve_chunks(query, document_id=document_id)
-
+    available_docs = get_all_documents()
+    
     if not chunks:
-        yield json.dumps({"type": "chunk", "content": "I couldn't find any relevant information in the uploaded documents to answer your question. Please make sure you've uploaded a document and try rephrasing your question."})
-        yield json.dumps({"type": "done"})
-        return
+        # If no chunks match, still try to answer if it's a meta-question about documents
+        context_prompt = build_context_prompt([], query, available_docs)
+    else:
+        context_prompt = build_context_prompt(chunks, query, available_docs)
 
-    # 2. Send sources first
-    sources_data = [
-        {
-            "text": c.text,
-            "page_number": c.page_number,
-            "chunk_index": c.chunk_index,
-            "document_name": c.document_name,
-            "similarity_score": c.similarity_score,
-        }
-        for c in chunks
-    ]
-    yield json.dumps({"type": "sources", "data": sources_data})
-
-    # 3. Build prompt and stream response
-    context_prompt = build_context_prompt(chunks, query)
+    sources_data = [{
+        "text": c.text,
+        "page_number": c.page_number,
+        "chunk_index": c.chunk_index,
+        "document_name": c.document_name,
+        "header_context": c.header_context,
+        "similarity_score": round(c.similarity_score * 1000, 2), # RRF scores are small, scale for UI
+    } for c in chunks]
+    
+    if sources_data:
+        yield json.dumps({"type": "sources", "data": sources_data})
 
     response = client.models.generate_content_stream(
         model=GENERATION_MODEL,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[types.Part(text=context_prompt)],
-            ),
-        ],
+        contents=[types.Content(role="user", parts=[types.Part(text=context_prompt)])],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.3,
             max_output_tokens=2048,
         ),
     )
-
     for resp_chunk in response or []:
         if resp_chunk.text:
             yield json.dumps({"type": "chunk", "content": resp_chunk.text})
-
     yield json.dumps({"type": "done"})
-
-
-# ── Document Management ──────────────────────────────────────
-
-def process_document(
-    file_bytes: bytes,
-    filename: str,
-    file_type: str,
-) -> DocumentInfo:
-    """Full pipeline: extract → chunk → embed → store. Returns doc info."""
-    document_id = str(uuid.uuid4())
-
-    # Extract text
-    if file_type == "application/pdf" or filename.lower().endswith(".pdf"):
-        pages = extract_text_from_pdf(file_bytes)
-        ftype = "pdf"
-    else:
-        pages = extract_text_from_txt(file_bytes)
-        ftype = "txt"
-
-    if not pages:
-        raise ValueError("Could not extract any text from the uploaded file.")
-
-    # Chunk
-    chunks = chunk_text(pages, document_id, filename)
-
-    if not chunks:
-        raise ValueError("No meaningful text chunks could be created from the document.")
-
-    # Embed and store
-    store_chunks(chunks)
-
-    from datetime import datetime, timezone
-    info = DocumentInfo(
-        id=document_id,
-        name=filename,
-        num_chunks=len(chunks),
-        num_pages=max(p["page"] for p in pages),
-        file_type=ftype,
-        uploaded_at=datetime.now(timezone.utc).isoformat(),
-    )
-
-    return info
-
-
-def get_all_documents() -> List[Dict[str, Any]]:
-    """Get all unique documents from the vector store."""
-    all_meta = vector_store.get_all_metadata()
-
-    if not all_meta:
-        return []
-
-    docs: Dict[str, Dict[str, Any]] = {}
-    for meta in all_meta:
-        doc_id = meta.get("document_id", "")
-        if doc_id and doc_id not in docs:
-            docs[doc_id] = {
-                "id": doc_id,
-                "name": meta.get("document_name", "Unknown"),
-                "chunk_count": 0,
-                "max_page": 0,
-            }
-        if doc_id in docs:
-            docs[doc_id]["chunk_count"] += 1
-            page = meta.get("page_number", 0)
-            if page > docs[doc_id]["max_page"]:
-                docs[doc_id]["max_page"] = page
-
-    return list(docs.values())
-
-
-def delete_document(document_id: str) -> bool:
-    """Delete all chunks for a document from the vector store."""
-    return vector_store.delete_by("document_id", document_id)
