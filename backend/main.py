@@ -20,7 +20,7 @@ from rag_engine import (
 
 # ── App Setup ────────────────────────────────────────────────
 app = FastAPI(
-    title="DocuMind AI",
+    title="Needle AI",
     description="Document-Based AI Assistant with RAG",
     version="1.0.0",
 )

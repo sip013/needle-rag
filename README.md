@@ -98,6 +98,9 @@ While the architecture is highly advanced, a true production deployment requires
 2. **Scanned Documents (OCR):** `PyMuPDF` is exceptionally fast for digital PDFs but lacks built-in OCR. Scanned signed contracts will extract as empty or garbled text. *Roadmap:* Implement a Tesseract or cloud OCR fallback path for image-based PDFs.
 3. **Advanced Error Recovery:** While password-protected or corrupted files are caught and rejected gracefully, partial failures (e.g., extracting 50 out of 100 pages before corruption) should support partial ingestion states.
 
+### ☁️ Hosting Disclaimer (Render Free Tier)
+The live demonstration is hosted on Render's free tier, which imposes a strict **512MB RAM limit**. Because the architecture utilizes a completely local, privacy-first embedding model (`all-MiniLM-L6-v2`) rather than calling external APIs for chunk vectorization, the memory overhead during document ingestion often exceeds 512MB. 
+**As a result, document uploads on the live hosted version may fail due to Out-Of-Memory (OOM) crashes.** For a stable, flawless experience, please run the application locally following the Quick Start guide below.
 ---
 
 ## 🚀 Quick Start
@@ -110,8 +113,8 @@ While the architecture is highly advanced, a true production deployment requires
 ### Setup
 
 ```bash
-# 1. Clone / navigate to the project
-cd Portfolio
+# 1. Unzip and navigate to the extracted project folder
+cd <extracted-folder-name>
 
 # 2. Create a virtual environment
 python -m venv venv
